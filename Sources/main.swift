@@ -1,6 +1,7 @@
 import Cocoa
 import ApplicationServices
 
+@MainActor
 class HoverRaiser {
     private var lastRaisedWindow: AXUIElement?
     private var lastRaisedPID: pid_t = 0
@@ -18,7 +19,8 @@ class HoverRaiser {
     }
     
     private func checkAccessibilityPermissions() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        // Use the raw string key to avoid Swift 6 concurrency issues with the global constant
+        let options = ["AXTrustedCheckOptionPrompt" as CFString: kCFBooleanTrue!] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(options)
         
         if !trusted {
@@ -69,25 +71,29 @@ class HoverRaiser {
         CFRunLoopRun()
     }
     
-    private func handleMouseMoved(event: CGEvent) {
+    private nonisolated func handleMouseMoved(event: CGEvent) {
         let mouseLocation = event.location
         
         // Find the window under the cursor
         guard let (window, pid) = getWindowAtPoint(mouseLocation) else {
-            cancelPendingRaise()
+            Task { @MainActor in
+                self.cancelPendingRaise()
+            }
             return
         }
         
-        // Don't re-raise the same window
-        if let lastWindow = lastRaisedWindow,
-           CFEqual(window, lastWindow),
-           pid == lastRaisedPID {
-            cancelPendingRaise()
-            return
+        Task { @MainActor in
+            // Don't re-raise the same window
+            if let lastWindow = self.lastRaisedWindow,
+               CFEqual(window, lastWindow),
+               pid == self.lastRaisedPID {
+                self.cancelPendingRaise()
+                return
+            }
+            
+            // Schedule a delayed raise (prevents flickering when moving quickly)
+            self.scheduleRaise(window: window, pid: pid)
         }
-        
-        // Schedule a delayed raise (prevents flickering when moving quickly)
-        scheduleRaise(window: window, pid: pid)
     }
     
     private func scheduleRaise(window: AXUIElement, pid: pid_t) {
@@ -98,7 +104,9 @@ class HoverRaiser {
         pendingPID = pid
         
         raiseTimer = Timer.scheduledTimer(withTimeInterval: raiseDelay, repeats: false) { [weak self] _ in
-            self?.performRaise()
+            Task { @MainActor in
+                self?.performRaise()
+            }
         }
     }
     
@@ -126,7 +134,7 @@ class HoverRaiser {
         pendingPID = 0
     }
     
-    private func getWindowAtPoint(_ point: CGPoint) -> (AXUIElement, pid_t)? {
+    private nonisolated func getWindowAtPoint(_ point: CGPoint) -> (AXUIElement, pid_t)? {
         // Get the element at the mouse position
         var element: AXUIElement?
         let systemWide = AXUIElementCreateSystemWide()
