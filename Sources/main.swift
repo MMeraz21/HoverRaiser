@@ -1,5 +1,6 @@
 import Cocoa
 import ApplicationServices
+import os
 
 @MainActor
 class HoverRaiser {
@@ -13,6 +14,10 @@ class HoverRaiser {
     private var raiseTimer: Timer?
     private var pendingWindow: AXUIElement?
     private var pendingPID: pid_t = 0
+    
+    // Throttling to prevent performance issues (nonisolated for access from callback)
+    private nonisolated(unsafe) var lastProcessedTime: CFAbsoluteTime = 0
+    private let throttleInterval: CFAbsoluteTime = 0.05  // Process at most every 50ms
     
     init() {
         checkAccessibilityPermissions()
@@ -72,17 +77,25 @@ class HoverRaiser {
     }
     
     private nonisolated func handleMouseMoved(event: CGEvent) {
+        // Throttle: skip if we processed too recently
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastProcessedTime >= throttleInterval else { return }
+        lastProcessedTime = now
+        
         let mouseLocation = event.location
         
-        // Find the window under the cursor
+        // Find the window under the cursor (do this on the callback thread to reduce main thread work)
         guard let (window, pid) = getWindowAtPoint(mouseLocation) else {
-            Task { @MainActor in
-                self.cancelPendingRaise()
+            DispatchQueue.main.async { [weak self] in
+                self?.cancelPendingRaise()
             }
             return
         }
         
-        Task { @MainActor in
+        // Dispatch to main thread for UI work
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
             // Don't re-raise the same window
             if let lastWindow = self.lastRaisedWindow,
                CFEqual(window, lastWindow),
@@ -104,7 +117,7 @@ class HoverRaiser {
         pendingPID = pid
         
         raiseTimer = Timer.scheduledTimer(withTimeInterval: raiseDelay, repeats: false) { [weak self] _ in
-            Task { @MainActor in
+            DispatchQueue.main.async {
                 self?.performRaise()
             }
         }
@@ -120,18 +133,12 @@ class HoverRaiser {
     private func performRaise() {
         guard let window = pendingWindow else { return }
         
-        // Get the app name for debugging
-        var titleRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
-        let windowTitle = (titleRef as? String) ?? "Unknown"
-        
         // Raise the window (brings to front)
-        let raiseResult = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         
         // Activate the app to give it keyboard focus
         if let app = NSRunningApplication(processIdentifier: pendingPID) {
             app.activate()
-            print("Raised: \"\(windowTitle)\" (\(app.localizedName ?? "Unknown app")) - raise: \(raiseResult == .success ? "✓" : "✗")")
         }
         
         lastRaisedWindow = window
