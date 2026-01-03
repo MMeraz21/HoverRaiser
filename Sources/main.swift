@@ -120,12 +120,19 @@ class HoverRaiser {
     private func performRaise() {
         guard let window = pendingWindow else { return }
         
-        // Raise the window
-        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        // Get the app name for debugging
+        var titleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
+        let windowTitle = (titleRef as? String) ?? "Unknown"
         
-        // Optionally activate the application (bring to front)
-        let app = NSRunningApplication(processIdentifier: pendingPID)
-        app?.activate(options: [])
+        // Raise the window (brings to front)
+        let raiseResult = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        
+        // Activate the app to give it keyboard focus
+        if let app = NSRunningApplication(processIdentifier: pendingPID) {
+            app.activate()
+            print("Raised: \"\(windowTitle)\" (\(app.localizedName ?? "Unknown app")) - raise: \(raiseResult == .success ? "✓" : "✗")")
+        }
         
         lastRaisedWindow = window
         lastRaisedPID = pendingPID
