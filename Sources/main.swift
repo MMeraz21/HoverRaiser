@@ -136,8 +136,11 @@ class HoverRaiser {
         // Raise the window (brings to front)
         AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         
-        // Activate the app to give it keyboard focus
-        if let app = NSRunningApplication(processIdentifier: pendingPID) {
+        // Only activate if it's a different app than the current frontmost
+        // This prevents hiding windows when switching between windows of the same app
+        if let app = NSRunningApplication(processIdentifier: pendingPID),
+           let frontmost = NSWorkspace.shared.frontmostApplication,
+           app.processIdentifier != frontmost.processIdentifier {
             app.activate()
         }
         
