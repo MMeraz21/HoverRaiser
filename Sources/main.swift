@@ -4,16 +4,13 @@ import os
 
 @MainActor
 class HoverRaiser {
-    private var lastRaisedWindow: AXUIElement?
-    private var lastRaisedPID: pid_t = 0
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     
-    // Delay before raising (in seconds) - prevents accidental raises
-    private let raiseDelay: TimeInterval = 0.15
+    // Delay before raising (in seconds) - prevents accidental raises at monitor edges
+    private let raiseDelay: TimeInterval = 0.1
     private var raiseTimer: Timer?
-    private var pendingWindow: AXUIElement?
-    private var pendingPID: pid_t = 0
+    private var pendingScreen: NSScreen?
     
     // Throttling to prevent performance issues (nonisolated for access from callback)
     private nonisolated(unsafe) var lastProcessedTime: CFAbsoluteTime = 0
@@ -27,7 +24,6 @@ class HoverRaiser {
     }
     
     private func checkAccessibilityPermissions() {
-        // Use the raw string key to avoid Swift 6 concurrency issues with the global constant
         let options = ["AXTrustedCheckOptionPrompt" as CFString: kCFBooleanTrue!] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(options)
         
@@ -44,8 +40,8 @@ class HoverRaiser {
     
     func start() {
         print("🚀 HoverRaiser started")
-        print("   • Hover to raise windows when crossing monitors")
-        print("   • Click to raise windows on the same monitor")
+        print("   • Cross to a different monitor → raises topmost window on that monitor")
+        print("   • Same monitor → click to raise (normal macOS behavior)")
         print("   Press Ctrl+C to quit")
         
         // Initialize last monitor to current mouse location
@@ -56,8 +52,6 @@ class HoverRaiser {
         
         // Create event tap for mouse moved events
         let eventMask: CGEventMask = (1 << CGEventType.mouseMoved.rawValue)
-        
-        // Store self in a way we can access from the callback
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         
         eventTap = CGEvent.tapCreate(
@@ -83,13 +77,10 @@ class HoverRaiser {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
         
-        // Run the event loop
         CFRunLoopRun()
     }
     
-    /// Get the NSScreen containing the given point (in screen coordinates)
     private nonisolated func getScreenContaining(point: NSPoint) -> NSScreen? {
-        // NSScreen.screens is safe to call from any thread
         for screen in NSScreen.screens {
             if screen.frame.contains(point) {
                 return screen
@@ -98,9 +89,7 @@ class HoverRaiser {
         return NSScreen.screens.first
     }
     
-    /// Convert CGEvent location (top-left origin) to NSScreen coordinates (bottom-left origin)
     private nonisolated func convertToScreenCoordinates(_ cgPoint: CGPoint) -> NSPoint {
-        // Get the main screen height for coordinate conversion
         guard let mainScreen = NSScreen.screens.first else {
             return NSPoint(x: cgPoint.x, y: cgPoint.y)
         }
@@ -109,7 +98,7 @@ class HoverRaiser {
     }
     
     private nonisolated func handleMouseMoved(event: CGEvent) {
-        // Throttle: skip if we processed too recently
+        // Throttle
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastProcessedTime >= throttleInterval else { return }
         lastProcessedTime = now
@@ -123,36 +112,19 @@ class HoverRaiser {
         
         // Check if we've changed monitors
         let monitorChanged = (currentMonitorHash != lastMonitorHash) && (lastMonitorHash != 0)
-        
-        // Update last monitor
         lastMonitorHash = currentMonitorHash
         
-        // Only raise if we crossed to a different monitor
         guard monitorChanged else { return }
         
-        // Find the window under the cursor
-        guard let (window, pid) = getWindowAtPoint(cgLocation) else {
-            DispatchQueue.main.async { [weak self] in
-                self?.cancelPendingRaise()
-            }
-            return
-        }
-        
-        // Dispatch to main thread for UI work
+        // Dispatch to main thread - raise the topmost window on the new screen
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            
-            // Schedule a delayed raise (prevents flickering when moving quickly)
-            self.scheduleRaise(window: window, pid: pid)
+            self?.scheduleRaise(for: currentScreen)
         }
     }
     
-    private func scheduleRaise(window: AXUIElement, pid: pid_t) {
-        // Cancel any pending raise
+    private func scheduleRaise(for screen: NSScreen) {
         raiseTimer?.invalidate()
-        
-        pendingWindow = window
-        pendingPID = pid
+        pendingScreen = screen
         
         raiseTimer = Timer.scheduledTimer(withTimeInterval: raiseDelay, repeats: false) { [weak self] _ in
             DispatchQueue.main.async {
@@ -164,79 +136,126 @@ class HoverRaiser {
     private func cancelPendingRaise() {
         raiseTimer?.invalidate()
         raiseTimer = nil
-        pendingWindow = nil
-        pendingPID = 0
+        pendingScreen = nil
     }
     
     private func performRaise() {
-        guard let window = pendingWindow else { return }
+        guard let screen = pendingScreen else { return }
         
-        // Raise the window (brings to front)
+        // Find the topmost window on this screen
+        guard let (window, pid) = getTopmostWindowOnScreen(screen) else {
+            pendingScreen = nil
+            return
+        }
+        
+        // Raise the window
         AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         
-        // Only activate if it's a different app than the current frontmost
-        // This prevents hiding windows when switching between windows of the same app
-        if let app = NSRunningApplication(processIdentifier: pendingPID),
+        // Activate the app if it's different from frontmost
+        if let app = NSRunningApplication(processIdentifier: pid),
            let frontmost = NSWorkspace.shared.frontmostApplication,
            app.processIdentifier != frontmost.processIdentifier {
             app.activate()
         }
         
-        lastRaisedWindow = window
-        lastRaisedPID = pendingPID
-        
-        pendingWindow = nil
-        pendingPID = 0
+        pendingScreen = nil
     }
     
-    private nonisolated func getWindowAtPoint(_ point: CGPoint) -> (AXUIElement, pid_t)? {
-        // Get the element at the mouse position
-        var element: AXUIElement?
-        let systemWide = AXUIElementCreateSystemWide()
-        
-        let result = AXUIElementCopyElementAtPosition(systemWide, Float(point.x), Float(point.y), &element)
-        
-        guard result == .success, let element = element else {
+    /// Find the topmost (frontmost) window that's primarily on the given screen
+    private func getTopmostWindowOnScreen(_ targetScreen: NSScreen) -> (AXUIElement, pid_t)? {
+        // Get all on-screen windows, ordered front-to-back
+        guard let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return nil
         }
         
-        // Get the window containing this element
-        var window: AXUIElement?
-        var currentElement: AXUIElement? = element
+        let targetFrame = targetScreen.frame
+        let myPID = getpid()
         
-        while let current = currentElement {
-            var role: CFTypeRef?
-            AXUIElementCopyAttributeValue(current, kAXRoleAttribute as CFString, &role)
-            
-            if let roleStr = role as? String, roleStr == kAXWindowRole as String {
-                window = current
-                break
+        for windowInfo in windowList {
+            // Skip windows without bounds
+            guard let boundsDict = windowInfo[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = boundsDict["X"],
+                  let y = boundsDict["Y"],
+                  let width = boundsDict["Width"],
+                  let height = boundsDict["Height"] else {
+                continue
             }
             
-            var parent: CFTypeRef?
-            let parentResult = AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parent)
+            // Skip tiny windows (likely system UI)
+            guard width > 50 && height > 50 else { continue }
             
-            if parentResult == .success, CFGetTypeID(parent!) == AXUIElementGetTypeID() {
-                currentElement = (parent as! AXUIElement)
-            } else {
-                break
+            let windowFrame = CGRect(x: x, y: y, width: width, height: height)
+            
+            // Check if window center is on target screen (using CG coordinates)
+            let windowCenter = CGPoint(x: windowFrame.midX, y: windowFrame.midY)
+            
+            // Convert target screen frame to CG coordinates (flip Y)
+            guard let mainScreen = NSScreen.screens.first else { continue }
+            let mainHeight = mainScreen.frame.height
+            let targetCGFrame = CGRect(
+                x: targetFrame.origin.x,
+                y: mainHeight - targetFrame.origin.y - targetFrame.height,
+                width: targetFrame.width,
+                height: targetFrame.height
+            )
+            
+            guard targetCGFrame.contains(windowCenter) else { continue }
+            
+            // Get the PID
+            guard let pid = windowInfo[kCGWindowOwnerPID as String] as? pid_t else { continue }
+            
+            // Skip our own windows
+            guard pid != myPID else { continue }
+            
+            // Skip certain system processes
+            if let ownerName = windowInfo[kCGWindowOwnerName as String] as? String {
+                let skipApps = ["Window Server", "Dock", "SystemUIServer", "Control Center", "Notification Center"]
+                if skipApps.contains(ownerName) { continue }
             }
+            
+            // Get the window's layer - skip if it's not a normal window layer
+            if let layer = windowInfo[kCGWindowLayer as String] as? Int, layer != 0 {
+                continue
+            }
+            
+            // Found a good window - now get its AXUIElement
+            let appElement = AXUIElementCreateApplication(pid)
+            var windowsRef: CFTypeRef?
+            let result = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef)
+            
+            guard result == .success,
+                  let windows = windowsRef as? [AXUIElement],
+                  !windows.isEmpty else {
+                continue
+            }
+            
+            // Try to find the matching window by position
+            for axWindow in windows {
+                var positionRef: CFTypeRef?
+                var sizeRef: CFTypeRef?
+                
+                AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &positionRef)
+                AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef)
+                
+                if let positionRef = positionRef, let sizeRef = sizeRef {
+                    var position = CGPoint.zero
+                    var size = CGSize.zero
+                    AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
+                    AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+                    
+                    // Check if this AX window matches the CG window (approximately)
+                    if abs(position.x - windowFrame.origin.x) < 5 &&
+                       abs(position.y - windowFrame.origin.y) < 5 {
+                        return (axWindow, pid)
+                    }
+                }
+            }
+            
+            // If we couldn't match by position, just return the first window
+            return (windows[0], pid)
         }
         
-        guard let foundWindow = window else {
-            return nil
-        }
-        
-        // Get the PID
-        var pid: pid_t = 0
-        AXUIElementGetPid(foundWindow, &pid)
-        
-        // Don't raise our own process or the system UI
-        if pid == getpid() || pid == 0 {
-            return nil
-        }
-        
-        return (foundWindow, pid)
+        return nil
     }
     
     func stop() {
