@@ -19,6 +19,9 @@ class HoverRaiser {
     private nonisolated(unsafe) var lastProcessedTime: CFAbsoluteTime = 0
     private let throttleInterval: CFAbsoluteTime = 0.05  // Process at most every 50ms
     
+    // Track which monitor the mouse is on (for monitor-change detection)
+    private nonisolated(unsafe) var lastMonitorHash: Int = 0
+    
     init() {
         checkAccessibilityPermissions()
     }
@@ -40,8 +43,16 @@ class HoverRaiser {
     }
     
     func start() {
-        print("🚀 HoverRaiser started - hover over windows to raise them")
+        print("🚀 HoverRaiser started")
+        print("   • Hover to raise windows when crossing monitors")
+        print("   • Click to raise windows on the same monitor")
         print("   Press Ctrl+C to quit")
+        
+        // Initialize last monitor to current mouse location
+        let initialLocation = NSEvent.mouseLocation
+        if let screen = getScreenContaining(point: initialLocation) {
+            lastMonitorHash = screen.hash
+        }
         
         // Create event tap for mouse moved events
         let eventMask: CGEventMask = (1 << CGEventType.mouseMoved.rawValue)
@@ -76,16 +87,51 @@ class HoverRaiser {
         CFRunLoopRun()
     }
     
+    /// Get the NSScreen containing the given point (in screen coordinates)
+    private nonisolated func getScreenContaining(point: NSPoint) -> NSScreen? {
+        // NSScreen.screens is safe to call from any thread
+        for screen in NSScreen.screens {
+            if screen.frame.contains(point) {
+                return screen
+            }
+        }
+        return NSScreen.screens.first
+    }
+    
+    /// Convert CGEvent location (top-left origin) to NSScreen coordinates (bottom-left origin)
+    private nonisolated func convertToScreenCoordinates(_ cgPoint: CGPoint) -> NSPoint {
+        // Get the main screen height for coordinate conversion
+        guard let mainScreen = NSScreen.screens.first else {
+            return NSPoint(x: cgPoint.x, y: cgPoint.y)
+        }
+        let screenHeight = mainScreen.frame.height
+        return NSPoint(x: cgPoint.x, y: screenHeight - cgPoint.y)
+    }
+    
     private nonisolated func handleMouseMoved(event: CGEvent) {
         // Throttle: skip if we processed too recently
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastProcessedTime >= throttleInterval else { return }
         lastProcessedTime = now
         
-        let mouseLocation = event.location
+        let cgLocation = event.location
+        let screenLocation = convertToScreenCoordinates(cgLocation)
         
-        // Find the window under the cursor (do this on the callback thread to reduce main thread work)
-        guard let (window, pid) = getWindowAtPoint(mouseLocation) else {
+        // Get current monitor
+        guard let currentScreen = getScreenContaining(point: screenLocation) else { return }
+        let currentMonitorHash = currentScreen.hash
+        
+        // Check if we've changed monitors
+        let monitorChanged = (currentMonitorHash != lastMonitorHash) && (lastMonitorHash != 0)
+        
+        // Update last monitor
+        lastMonitorHash = currentMonitorHash
+        
+        // Only raise if we crossed to a different monitor
+        guard monitorChanged else { return }
+        
+        // Find the window under the cursor
+        guard let (window, pid) = getWindowAtPoint(cgLocation) else {
             DispatchQueue.main.async { [weak self] in
                 self?.cancelPendingRaise()
             }
@@ -95,14 +141,6 @@ class HoverRaiser {
         // Dispatch to main thread for UI work
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            
-            // Don't re-raise the same window
-            if let lastWindow = self.lastRaisedWindow,
-               CFEqual(window, lastWindow),
-               pid == self.lastRaisedPID {
-                self.cancelPendingRaise()
-                return
-            }
             
             // Schedule a delayed raise (prevents flickering when moving quickly)
             self.scheduleRaise(window: window, pid: pid)
