@@ -148,21 +148,53 @@ class HoverRaiser {
             return
         }
         
-        // Raise the window
+        // Before activating, remember the topmost windows on OTHER monitors
+        // so we can restore them visually after activation
+        let windowsToRestore = getTopmostWindowsOnOtherScreens(excludingScreen: screen, excludingPID: pid)
+        
+        // Raise and activate our target window
         AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         
-        // Activate the app if it's different from frontmost
         if let app = NSRunningApplication(processIdentifier: pid),
            let frontmost = NSWorkspace.shared.frontmostApplication,
            app.processIdentifier != frontmost.processIdentifier {
             app.activate()
         }
         
+        // Now restore windows on other monitors by ONLY raising them (no activation)
+        // This puts them visually in front without stealing keyboard focus from our target
+        if !windowsToRestore.isEmpty {
+            // Small delay to let activation complete
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                for (restoreWindow, _) in windowsToRestore {
+                    AXUIElementPerformAction(restoreWindow, kAXRaiseAction as CFString)
+                }
+            }
+        }
+        
         pendingScreen = nil
     }
     
+    /// Get the topmost windows on all screens except the specified one, excluding windows from excludingPID
+    private func getTopmostWindowsOnOtherScreens(excludingScreen: NSScreen, excludingPID: pid_t) -> [(AXUIElement, pid_t)] {
+        var results: [(AXUIElement, pid_t)] = []
+        let excludedFrame = excludingScreen.frame
+        
+        for otherScreen in NSScreen.screens {
+            // Skip the target screen
+            if otherScreen.frame == excludedFrame { continue }
+            
+            // Find topmost window on this screen that's NOT from the app we're raising
+            if let (otherWindow, otherPID) = getTopmostWindowOnScreen(otherScreen, excludingPID: excludingPID) {
+                results.append((otherWindow, otherPID))
+            }
+        }
+        
+        return results
+    }
+    
     /// Find the topmost (frontmost) window that's primarily on the given screen
-    private func getTopmostWindowOnScreen(_ targetScreen: NSScreen) -> (AXUIElement, pid_t)? {
+    private func getTopmostWindowOnScreen(_ targetScreen: NSScreen, excludingPID: pid_t? = nil) -> (AXUIElement, pid_t)? {
         // Get all on-screen windows, ordered front-to-back
         guard let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return nil
@@ -206,6 +238,9 @@ class HoverRaiser {
             
             // Skip our own windows
             guard pid != myPID else { continue }
+            
+            // Skip windows from excluded PID (used when finding windows to restore)
+            if let excludingPID = excludingPID, pid == excludingPID { continue }
             
             // Skip certain system processes
             if let ownerName = windowInfo[kCGWindowOwnerName as String] as? String {
